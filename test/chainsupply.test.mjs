@@ -106,3 +106,88 @@ test('sui: a broken API answer fails the read', async () => {
   try { await assert.rejects(readSupply({ method: 'sui' }), /bad sui/); }
   finally { restore(); }
 });
+
+// Real response shapes captured from tonapi.io and toncenter.com on 2026-11-22.
+function fakeTon({
+  seqno = 106899815,
+  mcGrams = '2518587368660000000',
+  shards = [{ last_known_block: { value_flow: { to_next_blk: { grams: '2769169539050000000' } } } }],
+  lockerOk = true,
+  lockerNano = '1240902290670000000',
+  suspendedUntil = Math.floor(Date.now() / 1000) + 86400 * 90,
+  suspendedAccounts = Array.from({ length: 105 }, (_, i) => `0:${String(i).padStart(64, '0')}`),
+  bulkFail = false,
+  bulkShort = false,
+} = {}) {
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = async (url, opts = {}) => {
+    const u = String(url);
+    const reply = body => ({ ok: true, status: 200, json: async () => body });
+    if (u.endsWith('/v2/blockchain/masterchain-head')) {
+      return reply({ seqno, value_flow: { to_next_blk: { grams: mcGrams } } });
+    }
+    if (u.endsWith(`/v2/blockchain/masterchain/${seqno}/shards`)) {
+      return reply({ shards });
+    }
+    if (u.includes('toncenter.com/api/v2/getAddressBalance')) {
+      return reply({ ok: lockerOk, result: lockerNano });
+    }
+    if (u.endsWith('/v2/blockchain/config')) {
+      return reply({ '44': { suspended_until: suspendedUntil, accounts: suspendedAccounts } });
+    }
+    if (u.endsWith('/v2/accounts/_bulk')) {
+      if (bulkFail) return { ok: false, status: 500, text: async () => 'bulk error', json: async () => ({}) };
+      const req = JSON.parse(opts.body);
+      const list = bulkShort ? req.account_ids.slice(0, -1) : req.account_ids;
+      return reply({ accounts: list.map(addr => ({ address: addr, balance: '10000000000000' })) }); // 10,000 TON each
+    }
+    throw new Error('unexpected url ' + u);
+  };
+  return () => { globalThis.fetch = prevFetch; };
+}
+
+test('ton: sums masterchain and shards and subtracts Believers Fund locker and config param 44 frozen wallets', async () => {
+  const restore = fakeTon();
+  try {
+    const s = await readSupply({ method: 'ton' });
+    const expectedTotal = 2518587368.66 + 2769169539.05;
+    const expectedFrozen = 105 * 10000;
+    const expectedCirc = expectedTotal - 1240902290.67 - expectedFrozen;
+    assert.ok(Math.abs(s.total - expectedTotal) < 0.01);
+    assert.ok(Math.abs(s.circulating - expectedCirc) < 0.01);
+    assert.equal(s.excluded.length, 2);
+    assert.ok(s.excluded[1].reason.startsWith('105 frozen early-miner wallets'));
+    assert.equal(s.checked, true);
+  } finally {
+    restore();
+  }
+});
+
+test('ton: skips config param 44 frozen wallets once suspended_until has passed', async () => {
+  const restore = fakeTon({ suspendedUntil: 1700000000 });
+  try {
+    const s = await readSupply({ method: 'ton' });
+    assert.equal(s.excluded.length, 1);
+    assert.equal(s.excluded[0].holder, 'EQDtFpEwcFAEcRe5mLVh2N6C0x-_hJEM7W61_JLnSF74p4q2');
+  } finally {
+    restore();
+  }
+});
+
+test('ton: fails when masterchain, locker, or param 44 bulk balance read fails', async () => {
+  let restore = fakeTon({ mcGrams: null });
+  try { await assert.rejects(readSupply({ method: 'ton' }), /masterchain head/); }
+  finally { restore(); }
+
+  restore = fakeTon({ lockerOk: false });
+  try { await assert.rejects(readSupply({ method: 'ton' }), /locker balance/); }
+  finally { restore(); }
+
+  restore = fakeTon({ bulkFail: true });
+  try { await assert.rejects(readSupply({ method: 'ton' }), /500/); }
+  finally { restore(); }
+
+  restore = fakeTon({ bulkShort: true });
+  try { await assert.rejects(readSupply({ method: 'ton' }), /bulk response/); }
+  finally { restore(); }
+});
