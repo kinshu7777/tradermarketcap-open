@@ -683,6 +683,111 @@ const METHODS = {
       note: r.note,
     };
   },
+  // Avalanche (AVAX): staked AVAX counts as circulating (same policy as ETH and SOL, and matching
+  // Avalanche's own published figure). We read P-Chain platform.getCurrentSupply, the C-Chain burn
+  // address (0x0100...0000) via evm('avax', 'eth_getBalance', ...), and Avalanche's first-party
+  // Data API (data-api.avax.network/v1/avax/supply, getAvaxSupply on docs.avax.network), which
+  // subtracts C-Chain, P-Chain and X-Chain burned AVAX from minted supply (genesisUnlock +
+  // totalRewards) without subtracting stake. The live C-Chain burn balance and the P-Chain net
+  // supply are cross-checked against the Data API every pass so any stale or broken source fails closed.
+  async avax() {
+    const pRpc = 'https://api.avax.network/ext/bc/P';
+    const apiUrl = 'https://data-api.avax.network/v1/avax/supply';
+    const cBurnAddr = '0x0100000000000000000000000000000000000000';
+    const [pRes, cBurnHex, api] = await Promise.all([
+      getJSON(pRpc, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'platform.getCurrentSupply', params: {} }),
+      }),
+      evm('avax', 'eth_getBalance', [cBurnAddr, 'latest']),
+      getJSON(apiUrl),
+    ]);
+    if (pRes?.error) throw new Error(`avax platform.getCurrentSupply: ${pRes.error.message || JSON.stringify(pRes.error)}`);
+    const rawPSupply = pRes?.result?.supply;
+    if (typeof rawPSupply !== 'string' || !/^\d+$/.test(rawPSupply)) throw new Error('avax: bad P-Chain supply');
+    const pSupply = Number(BigInt(rawPSupply)) / 1e9;
+    if (!(pSupply > 4e8)) throw new Error(`avax: implausible P-Chain supply ${pSupply}`);
+
+    if (typeof cBurnHex !== 'string' || !/^0x[0-9a-f]+$/i.test(cBurnHex)) throw new Error('avax: bad C-Chain burn balance');
+    const cBurnChain = Number(BigInt(cBurnHex) / 10n ** 9n) / 1e9;
+    if (!(cBurnChain > 0)) throw new Error('avax: empty C-Chain burn balance');
+
+    const apiTotal = Number(api?.totalSupply);
+    const apiCirc = Number(api?.circulatingSupply);
+    const cBurnApi = Number(api?.totalCBurned);
+    const pBurnApi = Number(api?.totalPBurned);
+    const xBurnApi = Number(api?.totalXBurned);
+    if (![apiTotal, apiCirc, cBurnApi, pBurnApi, xBurnApi].every(v => Number.isFinite(v) && v >= 0)) {
+      throw new Error('avax: invalid Data API supply or burn figures');
+    }
+    if (!(apiTotal > 4e8) || !(apiCirc > 4e8) || !(cBurnApi > 0)) {
+      throw new Error(`avax: implausible Data API supply total=${apiTotal} circ=${apiCirc}`);
+    }
+    if (apiCirc > apiTotal) throw new Error(`avax: circulating ${apiCirc} exceeds total ${apiTotal}`);
+    if (apiCirc < apiTotal - 1) throw new Error(`avax: Data API circulating ${apiCirc} below total ${apiTotal}`);
+
+    if (api?.lastUpdated !== undefined) {
+      const updatedMs = Date.parse(api.lastUpdated);
+      if (!Number.isFinite(updatedMs) || Date.now() - updatedMs > 2 * 24 * 3600e3) {
+        throw new Error(`avax: Data API lastUpdated ${api.lastUpdated} is stale or invalid`);
+      }
+    }
+
+    if (api?.genesisUnlock !== undefined || api?.totalRewards !== undefined) {
+      const genesis = Number(api?.genesisUnlock);
+      const rewards = Number(api?.totalRewards);
+      if (!Number.isFinite(genesis) || !Number.isFinite(rewards) || !(genesis > 0) || !(rewards > 0)) {
+        throw new Error('avax: invalid Data API genesisUnlock or totalRewards');
+      }
+      const minted = genesis + rewards;
+      const totalBurnedApi = cBurnApi + pBurnApi + xBurnApi;
+      if (Math.abs(minted - totalBurnedApi - apiTotal) > 1) {
+        throw new Error(`avax: Data API parts do not reconcile (${minted} - ${totalBurnedApi} != ${apiTotal})`);
+      }
+      if (minted > pSupply + 1) {
+        throw new Error(`avax: Data API minted ${minted} exceeds P-Chain upper bound ${pSupply}`);
+      }
+    }
+
+    // C-Chain burn address holds burned C-Chain fees plus small direct transfers (~6.7K AVAX); must agree within 0.5%.
+    if (Math.abs(cBurnChain / cBurnApi - 1) > 0.005) {
+      throw new Error(`avax: C-Chain burn ${cBurnChain} disagrees with Data API totalCBurned ${cBurnApi}`);
+    }
+    // P-Chain getCurrentSupply includes ~1.26M AVAX of potential rewards for active staking periods not yet completed,
+    // so pSupply minus C/P/X burns sits ~0.27% above Data API totalSupply; more than 1% drift fails the read.
+    const chainNet = pSupply - cBurnChain - pBurnApi - xBurnApi;
+    if (!(chainNet > 4e8) || Math.abs(apiTotal / chainNet - 1) > 0.01) {
+      throw new Error(`avax: Data API total ${apiTotal} disagrees with chain net supply ${chainNet}`);
+    }
+
+    const total = Math.min(apiTotal, chainNet);
+    const circulating = Math.min(apiCirc, total);
+    return {
+      circulating,
+      total,
+      src: apiUrl,
+      excluded: [
+        {
+          reason: 'C-Chain burned AVAX (fee burn address)',
+          holder: cBurnAddr,
+          amount: cBurnChain,
+          src: `${EXPLORER.avax}/address/${cBurnAddr}`,
+        },
+        {
+          reason: 'X-Chain burned transaction fees',
+          amount: xBurnApi,
+          src: apiUrl,
+        },
+        {
+          reason: 'P-Chain burned transaction fees',
+          amount: pBurnApi,
+          src: apiUrl,
+        },
+      ],
+      note: 'P-Chain supply minus C-Chain, P-Chain and X-Chain burned AVAX, cross-checked between Avalanche Data API and live P-Chain / C-Chain RPC reads (staked AVAX counts as circulating).',
+    };
+  },
 };
 
 const SEI_GRINGOTTS_INFO = Buffer.from('{"info":{}}').toString('base64');
