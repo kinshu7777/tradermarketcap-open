@@ -1365,3 +1365,58 @@ test('VVV: API errors and NaN fail the read', async () => {
   fakeVenice({ burn: {} });
   await assert.rejects(readSupply({ method: 'venice' }), /totalBurned is not an amount/);
 });
+
+// Aster (ASTER): BEP-20 token on BNB Smart Chain.
+function fakeAster({
+  bscSupply = '8000000000000000000000000000',
+  deadBalance = '216176677891617120000000000',
+} = {}) {
+  globalThis.fetch = async (url, opts = {}) => {
+    const u = String(url);
+    assert.ok(u.includes('bsc-dataseed.bnbchain.org'), 'only BSC RPC is called: ' + u);
+    const req = JSON.parse(opts.body);
+    const data = req.params[0].data;
+    const reply = res => ({ ok: true, status: 200, json: async () => ({ jsonrpc: '2.0', id: req.id, result: res }) });
+    if (data.startsWith('0x313ce567')) return reply('0x' + '12'.padStart(64, '0')); // 18 decimals
+    if (data.startsWith('0x18160ddd')) {
+      return reply('0x' + BigInt(bscSupply).toString(16).padStart(64, '0'));
+    }
+    const holder = '0x' + data.slice(-40);
+    if (holder === '0x000000000000000000000000000000000000dead') {
+      return reply('0x' + BigInt(deadBalance).toString(16).padStart(64, '0'));
+    }
+    return reply('0x' + '0'.padStart(64, '0'));
+  };
+}
+
+test('Aster: seed rule in coins.json configures BSC token supply with dead burn excluded and circulating withheld', async () => {
+  const coins = JSON.parse(readFileSync(new URL('../data-seed/coins.json', import.meta.url), 'utf8'));
+  const aster = coins.aster;
+  assert.equal(aster.symbol, 'ASTER');
+  assert.equal(aster.name, 'Aster');
+  assert.equal(aster.supply.method, 'tokens');
+  assert.equal(aster.supply.circulating, false);
+  assert.equal(aster.supply.max, 8000000000);
+  assert.equal(aster.supply.parts.length, 1);
+  assert.equal(aster.supply.parts[0].chain, 'bsc');
+
+  fakeAster();
+  const s = await readSupply(aster.supply);
+  assert.equal(s.circulating, null, 'circulating is withheld, never overstated');
+  assert.equal(s.max, 8000000000);
+  assert.equal(s.total, 8000000000);
+  assert.equal(s.parts.length, 1);
+  assert.equal(s.excluded.length, 1);
+  assert.ok(Math.abs(s.excluded[0].amount - 216176677.891617) < 0.01);
+  assert.equal(s.method, 'tokens');
+  assert.equal(s.checked, true);
+  assert.match(s.note, /circulating supply is withheld/i);
+});
+
+test('Aster: BSC RPC failure fails the read instead of guessing', async () => {
+  globalThis.fetch = async () => ({ ok: false, status: 500, json: async () => ({ error: 'rpc fail' }) });
+  await assert.rejects(readSupply({
+    method: 'tokens',
+    parts: [{ chain: 'bsc', address: '0x000Ae314E2A2172a039B26378814C252734f556A' }]
+  }));
+});
