@@ -1365,3 +1365,37 @@ test('VVV: API errors and NaN fail the read', async () => {
   fakeVenice({ burn: {} });
   await assert.rejects(readSupply({ method: 'venice' }), /totalBurned is not an amount/);
 });
+
+test('Pump.fun: seed rule in coins.json configures Solana token supply with circulating withheld', async () => {
+  const coins = JSON.parse(readFileSync(new URL('../data-seed/coins.json', import.meta.url), 'utf8'));
+  const pump = coins['pump-fun'];
+  assert.equal(pump.symbol, 'PUMP');
+  assert.equal(pump.name, 'Pump.fun');
+  assert.equal(pump.supply.method, 'tokens');
+  assert.equal(pump.supply.circulating, false);
+  assert.equal(pump.supply.max, 1000000000000);
+  assert.equal(pump.supply.parts.length, 1);
+  assert.equal(pump.supply.parts[0].chain, 'sol');
+
+  const restore = fakeSol({ total: '820375385290371930' });
+  try {
+    const s = await readSupply(pump.supply);
+    assert.equal(s.circulating, null, 'circulating is withheld, never overstated');
+    assert.equal(s.max, 1000000000000);
+    assert.ok(Math.abs(s.total - 820375385290.372) < 0.01);
+    assert.equal(s.parts.length, 1);
+    assert.equal(s.method, 'tokens');
+    assert.equal(s.checked, true);
+    assert.match(s.note, /circulating supply is withheld/i);
+  } finally {
+    restore();
+  }
+});
+
+test('Pump.fun: Solana RPC error fails the read instead of guessing', async () => {
+  globalThis.fetch = async () => ({ ok: false, status: 500, json: async () => ({ error: 'rpc fail' }) });
+  await assert.rejects(readSupply({
+    method: 'tokens',
+    parts: [{ chain: 'sol', address: 'pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn' }]
+  }));
+});
