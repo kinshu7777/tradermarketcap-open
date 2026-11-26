@@ -1160,7 +1160,107 @@ const METHODS = {
       note: `Total read from Plasma mainnet (verified 10,000,000,000 XPL genesis stateRoot in ${PLASMA_GENESIS_SRC}, less ${fmt2(burned)} XPL burned at the zero and dead addresses; consensus withdrawals are empty and validator inflation is inactive until external stake delegation launches per ${PLASMA_DOCS_SRC}). The ${fmt(bscOftTotal)} bridged XPL on BNB Smart Chain (${EXPLORER.bsc}/token/${PLASMA_OFT}) are LayerZero OFT tokens backed by ${fmt(bridgeLocked)} XPL locked in Plasma's OFT adapter (${addrUrl(PLASMA_OFT)}), so they sit inside the mainnet total. The genesis and protocol Safes still hold ${fmt(safeHeld)} XPL on-chain. Circulating is withheld: Team (25%), Investors (25%) and Ecosystem & Growth (32% post-launch) unlock on schedule through 25 Sep 2028 (${PLASMA_DOCS_SRC}), XPL carries no protocol-level transfer lock (MiCA whitepaper G.11), and the Team and Investor genesis Safes moved their allocations to unpublished custody wallets, so subtracting only the genesis Safes would overstate circulating.`,
     };
   },
+  // MANTRA (mantra-1): native amantra (18 decimals, post block 13,000,000 1:4 split; legacy Ethereum
+  // ERC-20 OM deprecated 15 Jan 2026 per docs.mantrachain.io/mantra-token-background) read from x/bank,
+  // cross-checked against x/mint max_supply (10B), minus any balance at MANTRA's native burn address
+  // (mantra1qqqq...cg2my8 = 0x0000...0000). Uses a dedicated method rather than the generic `cosmos`
+  // reader because `cosmos` reads liquid x/bank balances only and misses staked delegations and
+  // unbonding balances in x/staking (where MANTRA's reserve and contributor custodians hold nearly all
+  // of their tokens), and does not cross-check x/mint max_supply or subtract zero-address burns.
+  async mantra(r = {}) {
+    const lcd = r.lcd || 'https://api.mantrachain.io';
+    const explorer = r.explorer || 'https://www.mintscan.io/mantra/address/';
+    const [sup, mint, cp, burnedAmantra] = await Promise.all([
+      getJSON(`${lcd}/cosmos/bank/v1beta1/supply/by_denom?denom=amantra`),
+      getJSON(`${lcd}/cosmos/mint/v1beta1/params`),
+      getJSON(`${lcd}/cosmos/distribution/v1beta1/community_pool`),
+      mantraAccountAmantra(lcd, MANTRA_BURN),
+    ]);
+    const rawBank = sup?.amount?.amount;
+    if (sup?.amount?.denom !== 'amantra' || typeof rawBank !== 'string' || !/^\d+$/.test(rawBank)) {
+      throw new Error('mantra: bad bank supply');
+    }
+    const rawMax = mint?.params?.max_supply;
+    if (mint?.params?.mint_denom !== 'amantra' || typeof rawMax !== 'string' || !/^\d+$/.test(rawMax)) {
+      throw new Error('mantra: bad mint params');
+    }
+    const bankTotal = BigInt(rawBank);
+    const maxAmantra = BigInt(rawMax);
+    if (burnedAmantra >= bankTotal) throw new Error('mantra: burned exceeds bank supply');
+    const netAmantra = bankTotal - burnedAmantra;
+    if (netAmantra <= 0n || netAmantra > maxAmantra) throw new Error('mantra: supply outside 0..max_supply');
+    const total = mantraFromAmantra(netAmantra);
+    const max = mantraFromAmantra(maxAmantra);
+    if (!(total > 5e9)) throw new Error('mantra: bad total supply ' + total);
+    if (r.max != null && Math.round(max) !== r.max) {
+      throw new Error(`mantra: mint max_supply ${max} != rule.max ${r.max}`);
+    }
+
+    if (!Array.isArray(cp?.pool)) throw new Error('mantra: bad community pool');
+    const cpEntry = cp.pool.find(x => x?.denom === 'amantra');
+    if (!cpEntry) throw new Error('mantra: missing amantra community pool');
+    const cpAmount = mantraFromDecAmantra(cpEntry.amount);
+    if (!Number.isFinite(cpAmount) || cpAmount < 0) throw new Error('mantra: invalid community pool amount');
+
+    const excluded = [];
+    if (burnedAmantra > 0n) {
+      excluded.push({
+        reason: 'MANTRA Chain native burn address (0x0000...0000; subtracted from total)',
+        holder: MANTRA_BURN,
+        amount: mantraFromAmantra(burnedAmantra),
+        src: explorer + MANTRA_BURN,
+      });
+    }
+    if (cpAmount > 0) {
+      excluded.push({
+        reason: 'Community pool (on-chain treasury)',
+        amount: cpAmount,
+        src: `${lcd}/cosmos/distribution/v1beta1/community_pool`,
+      });
+    }
+
+    const items = r.exclude || [];
+    for (let i = 0; i < items.length; i += 3) {
+      const chunk = items.slice(i, i + 3);
+      const balances = await Promise.all(chunk.map(e => mantraAccountAmantra(lcd, e.holder)));
+      for (let j = 0; j < chunk.length; j++) {
+        if (balances[j] > 0n) {
+          excluded.push({
+            reason: chunk[j].reason,
+            holder: chunk[j].holder,
+            amount: mantraFromAmantra(balances[j]),
+            src: explorer + chunk[j].holder,
+          });
+        }
+      }
+    }
+
+    const nonBurnOut = excluded.filter(e => e.holder !== MANTRA_BURN).reduce((s, e) => s + e.amount, 0);
+    const ceiling = total - nonBurnOut;
+    if (!Number.isFinite(ceiling) || !(ceiling > 0) || !(ceiling <= total)) {
+      throw new Error('mantra: bad circulating supply ' + ceiling);
+    }
+    const publish = r.circulating !== false;
+    return {
+      max,
+      circulating: publish ? ceiling : null,
+      total,
+      src: 'https://www.mintscan.io/mantra',
+      excluded,
+      note: r.note,
+    };
+  },
 };
+
+const AMANTRA = 10n ** 18n;
+const MANTRA_BURN = 'mantra1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqcg2my8';
+const mantraFromAmantra = a => Number(a / AMANTRA) + Number(a % AMANTRA) / 1e18;
+function mantraFromDecAmantra(raw) {
+  if (typeof raw !== 'string' || !/^\d+(?:\.\d+)?$/.test(raw)) throw new Error('mantra: bad decimal amount');
+  const [intPart, frac = ''] = raw.split('.');
+  const sub = frac ? Number('0.' + frac.slice(0, 18)) / 1e18 : 0;
+  return mantraFromAmantra(BigInt(intPart)) + sub;
+}
 
 const SEI_GRINGOTTS_INFO = Buffer.from('{"info":{}}').toString('base64');
 const seiFromUsei = u => Number(u / 1_000_000n) + Number(u % 1_000_000n) / 1e6;
@@ -1173,48 +1273,51 @@ function seiTimestampMs(raw) {
   return Number(v * 1000n);
 }
 
-// Full SEI balance (liquid + staked delegations + unbonding delegations) of one pacific-1 address in usei.
-// Delegated SEI moves out of x/bank into the staking pool, so subtracting a staked vesting contract or
+// Full Cosmos balance (liquid + staked delegations + unbonding delegations) of one address in base units.
+// Delegated stake moves out of x/bank into the staking pool, so subtracting a staked vesting contract or
 // treasury wallet requires summing all three.
-async function seiAccountUsei(lcd, addr) {
+async function cosmosAccountBalance(lcd, denom, tag, addr) {
   const [bal, del0, unb0] = await Promise.all([
-    getJSON(`${lcd}/cosmos/bank/v1beta1/balances/${addr}/by_denom?denom=usei`),
+    getJSON(`${lcd}/cosmos/bank/v1beta1/balances/${addr}/by_denom?denom=${denom}`),
     getJSON(`${lcd}/cosmos/staking/v1beta1/delegations/${addr}?pagination.limit=200`),
     getJSON(`${lcd}/cosmos/staking/v1beta1/delegators/${addr}/unbonding_delegations?pagination.limit=200`),
   ]);
   const rawBal = bal?.balance?.amount;
-  if (typeof rawBal !== 'string' || !/^\d+$/.test(rawBal)) throw new Error('sei: bad bank balance for ' + addr);
+  if (typeof rawBal !== 'string' || !/^\d+$/.test(rawBal)) throw new Error(`${tag}: bad bank balance for ${addr}`);
   let sum = BigInt(rawBal);
 
   for (let page = 0, del = del0; ; page++) {
-    if (!Array.isArray(del?.delegation_responses)) throw new Error('sei: bad delegations for ' + addr);
+    if (!Array.isArray(del?.delegation_responses)) throw new Error(`${tag}: bad delegations for ${addr}`);
     for (const d of del.delegation_responses) {
       const a = d?.balance?.amount;
-      if (typeof a !== 'string' || !/^\d+$/.test(a)) throw new Error('sei: bad delegation amount for ' + addr);
+      if (typeof a !== 'string' || !/^\d+$/.test(a)) throw new Error(`${tag}: bad delegation amount for ${addr}`);
+      if (d.balance?.denom && d.balance.denom !== denom) continue;
       sum += BigInt(a);
     }
     const next = del.pagination?.next_key;
     if (!next) break;
-    if (page >= 20) throw new Error('sei: too many delegation pages for ' + addr);
+    if (page >= 20) throw new Error(`${tag}: too many delegation pages for ${addr}`);
     del = await getJSON(`${lcd}/cosmos/staking/v1beta1/delegations/${addr}?pagination.limit=200&pagination.key=${encodeURIComponent(next)}`);
   }
 
   for (let page = 0, unb = unb0; ; page++) {
-    if (!Array.isArray(unb?.unbonding_responses)) throw new Error('sei: bad unbonding delegations for ' + addr);
+    if (!Array.isArray(unb?.unbonding_responses)) throw new Error(`${tag}: bad unbonding delegations for ${addr}`);
     for (const u of unb.unbonding_responses) {
-      if (!Array.isArray(u?.entries)) throw new Error('sei: bad unbonding entries for ' + addr);
+      if (!Array.isArray(u?.entries)) throw new Error(`${tag}: bad unbonding entries for ${addr}`);
       for (const e of u.entries) {
-        if (typeof e?.balance !== 'string' || !/^\d+$/.test(e.balance)) throw new Error('sei: bad unbonding balance for ' + addr);
+        if (typeof e?.balance !== 'string' || !/^\d+$/.test(e.balance)) throw new Error(`${tag}: bad unbonding balance for ${addr}`);
         sum += BigInt(e.balance);
       }
     }
     const next = unb.pagination?.next_key;
     if (!next) break;
-    if (page >= 20) throw new Error('sei: too many unbonding pages for ' + addr);
+    if (page >= 20) throw new Error(`${tag}: too many unbonding pages for ${addr}`);
     unb = await getJSON(`${lcd}/cosmos/staking/v1beta1/delegators/${addr}/unbonding_delegations?pagination.limit=200&pagination.key=${encodeURIComponent(next)}`);
   }
   return sum;
 }
+const seiAccountUsei = (lcd, addr) => cosmosAccountBalance(lcd, 'usei', 'sei', addr);
+const mantraAccountAmantra = (lcd, addr) => cosmosAccountBalance(lcd, 'amantra', 'mantra', addr);
 
 export async function readSupply(rule) {
   const f = METHODS[rule?.method];

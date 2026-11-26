@@ -1701,3 +1701,196 @@ test('aster: missing burn, supply above max, or a broken RPC fail closed', async
     await assert.rejects(readSupply({ method: 'aster' }), /403/);
   } finally { globalThis.fetch = prev; }
 });
+
+// ---------- MANTRA (mantra-1) ----------
+// Response shapes captured from https://api.mantrachain.io on 2026-11-26.
+const MANTRA_BURN = 'mantra1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqcg2my8';
+const MANTRA_UPGRADE = 'mantra14g459vwkat3r7xjerz4fkvcpyxdkuyezm0s2p8';
+const MANTRA_CONTRIB = 'mantra1yejpacug78zuqkzwwuc94c0a2al4mz4yfqquam';
+const MANTRA_PRESEED = 'mantra1kklp9gd2rk8zg8tuahnqzw28tjdvqwe5uskazy';
+const MANTRA_SEED = 'mantra133pw28metkmxtnt4jye68rcn2v88utd79tvxgk';
+const MANTRA_AIRDROP = 'mantra1c3fsupagvw40ex03hp7e4ezcdq9st4lcvy0r02';
+const MANTRA_ECO = 'mantra1w0q87xm6jfjgn3u3vn4d3fj34g5tcz6v0xwnux';
+
+function fakeMantra({
+  totalAmantra = '8416790992466420335898115879',
+  supplyDenom = 'amantra',
+  mintParams = { mint_denom: 'amantra', max_supply: '10000000000000000000000000000' },
+  pool = [{ denom: 'amantra', amount: '18034679219351389431044726.187556642725905656' }],
+  accounts = {},
+  failMatch = null,
+} = {}) {
+  const defaultAccounts = {
+    [MANTRA_BURN]: { liquid: '0', staked: [], unbonding: [] },
+    [MANTRA_UPGRADE]: {
+      liquid: '98000577549999999998',
+      staked: ['553577409871812598366611134'],
+      unbonding: [],
+    },
+    [MANTRA_CONTRIB]: {
+      liquid: '40000000000000000',
+      staked: ['348650818603940254642191274'],
+      unbonding: [],
+    },
+    [MANTRA_PRESEED]: {
+      liquid: '688161253147003397438343',
+      staked: ['87238594510000000000000000', '83645365290260000000000000'],
+      unbonding: [],
+    },
+    [MANTRA_SEED]: {
+      liquid: '351136288025070494314446',
+      staked: ['5280908133332000000000000', '4879333950000000000000000', '3265745000000000000000000'],
+      unbonding: [],
+    },
+    [MANTRA_AIRDROP]: { liquid: '4216205825162200000000000', staked: [], unbonding: [] },
+    [MANTRA_ECO]: { liquid: '88899822220000000000000', staked: ['352000000000000000000000'], unbonding: [] },
+    ...accounts,
+  };
+
+  globalThis.fetch = async url => {
+    const u = String(url);
+    if (failMatch && u.includes(failMatch)) {
+      return { ok: false, status: 502, json: async () => ({ code: 2, message: 'lcd down' }) };
+    }
+    const reply = body => ({ ok: true, status: 200, json: async () => body });
+    if (u.endsWith('/cosmos/bank/v1beta1/supply/by_denom?denom=amantra')) {
+      return reply({ amount: { denom: supplyDenom, amount: totalAmantra } });
+    }
+    if (u.endsWith('/cosmos/mint/v1beta1/params')) {
+      return reply({ params: mintParams });
+    }
+    if (u.endsWith('/cosmos/distribution/v1beta1/community_pool')) {
+      return reply({ pool });
+    }
+    let m = u.match(/\/cosmos\/bank\/v1beta1\/balances\/([^/?]+)\/by_denom\?denom=amantra$/);
+    if (m) {
+      const acc = defaultAccounts[m[1]] || { liquid: '0' };
+      return reply({ balance: { denom: 'amantra', amount: acc.liquid } });
+    }
+    m = u.match(/\/cosmos\/staking\/v1beta1\/delegations\/([^/?]+)\?pagination\.limit=200(?:&pagination\.key=([^&]+))?$/);
+    if (m) {
+      const acc = defaultAccounts[m[1]] || { staked: [] };
+      if (acc.stakedPages) {
+        const idx = m[2] ? Number(decodeURIComponent(m[2])) : 0;
+        const nextKey = idx + 1 < acc.stakedPages.length ? String(idx + 1) : null;
+        return reply({
+          delegation_responses: acc.stakedPages[idx].map(amount => ({ balance: { denom: 'amantra', amount } })),
+          pagination: { next_key: nextKey },
+        });
+      }
+      return reply({
+        delegation_responses: (acc.staked || []).map(amount => ({ balance: { denom: 'amantra', amount } })),
+        pagination: { next_key: null },
+      });
+    }
+    m = u.match(/\/cosmos\/staking\/v1beta1\/delegators\/([^/?]+)\/unbonding_delegations\?pagination\.limit=200(?:&pagination\.key=([^&]+))?$/);
+    if (m) {
+      const acc = defaultAccounts[m[1]] || { unbonding: [] };
+      return reply({
+        unbonding_responses: (acc.unbonding || []).length ? [{ entries: acc.unbonding.map(balance => ({ balance })) }] : [],
+        pagination: { next_key: null },
+      });
+    }
+    throw new Error('unexpected mantra url ' + u);
+  };
+}
+
+test('mantra: seed rule reads bank total, mint max_supply, community pool and genesis/custodian reserves while withholding circulating', async () => {
+  const prev = globalThis.fetch;
+  try {
+    const { mantra } = JSON.parse(readFileSync(new URL('../data-seed/coins.json', import.meta.url), 'utf8'));
+    assert.equal(mantra.symbol, 'MANTRA');
+    assert.equal(mantra.name, 'MANTRA');
+    assert.equal(mantra.supply.circulating, false, 'shipped rule withholds circulating rather than overstating');
+    assert.match(mantra.supply.note, /genesis\.json/);
+    assert.match(mantra.supply.note, /10 Apr 2027/);
+    assert.doesNotMatch(mantra.supply.note, /~\d/, 'no stale approximate live figures in note');
+    fakeMantra();
+    const s = await readSupply(mantra.supply);
+    assert.ok(Math.abs(s.total - 8416790992.46642) < 1e-4);
+    assert.equal(s.circulating, null, 'circulating is withheld, never overstated');
+    assert.equal(s.max, 10000000000);
+    assert.equal(s.checked, true);
+    assert.equal(s.src, 'https://www.mintscan.io/mantra');
+    // 1 community pool + 6 genesis/first-hop reserve accounts (burn wallet is 0 so omitted) = 7
+    assert.equal(s.excluded.length, 7);
+    const contrib = s.excluded.find(e => e.holder === MANTRA_CONTRIB);
+    const upgrade = s.excluded.find(e => e.holder === MANTRA_UPGRADE);
+    assert.ok(Math.abs(contrib.amount - 348650818.64394) < 1e-3, 'staked + liquid MANTRA in Core Contributors custodian');
+    assert.ok(Math.abs(upgrade.amount - 553577507.87239) < 1e-3, 'staked + liquid MANTRA in OM Upgrade Incentives genesis reserve');
+    assert.equal(contrib.src, `https://www.mintscan.io/mantra/address/${MANTRA_CONTRIB}`);
+  } finally { globalThis.fetch = prev; }
+});
+
+test('mantra: subtracts any burned amantra at the zero-address burn wallet from total without double-counting in circulating', async () => {
+  const prev = globalThis.fetch;
+  try {
+    const { mantra } = JSON.parse(readFileSync(new URL('../data-seed/coins.json', import.meta.url), 'utf8'));
+    fakeMantra({
+      accounts: {
+        [MANTRA_BURN]: { liquid: (100_000_000n * 10n ** 18n).toString(), staked: [], unbonding: [] },
+      },
+    });
+    const s = await readSupply({ ...mantra.supply, circulating: true });
+    assert.ok(Math.abs(s.total - 8316790992.46642) < 1e-4, '100M burned amantra subtracted from bank total');
+    const burnEntry = s.excluded.find(e => e.holder === MANTRA_BURN);
+    assert.equal(burnEntry.amount, 100000000);
+    const nonBurnOut = s.excluded.filter(e => e.holder !== MANTRA_BURN).reduce((sum, e) => sum + e.amount, 0);
+    assert.ok(Math.abs(s.total - nonBurnOut - s.circulating) < 1e-4, 'burn is not subtracted a second time from circulating');
+  } finally { globalThis.fetch = prev; }
+});
+
+test('mantra: sums paginated delegations and unbonding delegations on excluded accounts', async () => {
+  const prev = globalThis.fetch;
+  try {
+    const e18 = n => (BigInt(n) * 10n ** 18n).toString();
+    fakeMantra({
+      accounts: {
+        M1: {
+          liquid: e18(5),
+          stakedPages: [[e18(10)], [e18(25)]],
+          unbonding: [e18(60)],
+        },
+      },
+    });
+    const s = await readSupply({
+      method: 'mantra',
+      lcd: 'https://mantra.test',
+      exclude: [{ holder: 'M1', reason: 'Paginated test wallet' }],
+    });
+    assert.equal(s.excluded.find(e => e.holder === 'M1').amount, 100);
+  } finally { globalThis.fetch = prev; }
+});
+
+test('mantra: fails closed on HTTP errors, NaN/malformed strings, mint param mismatch, or out-of-range supply', async () => {
+  const prev = globalThis.fetch;
+  try {
+    const { mantra } = JSON.parse(readFileSync(new URL('../data-seed/coins.json', import.meta.url), 'utf8'));
+    fakeMantra({ totalAmantra: 'NaN' });
+    await assert.rejects(readSupply(mantra.supply), /bad bank supply/);
+
+    fakeMantra({ totalAmantra: (1000n * 10n ** 18n).toString() });
+    await assert.rejects(readSupply(mantra.supply), /bad total supply/);
+
+    fakeMantra({ mintParams: { mint_denom: 'amantra', max_supply: (9_000_000_000n * 10n ** 18n).toString() } });
+    await assert.rejects(readSupply(mantra.supply), /mint max_supply/);
+
+    fakeMantra({ pool: [] });
+    await assert.rejects(readSupply(mantra.supply), /missing amantra community pool/);
+
+    fakeMantra({ pool: [{ denom: 'amantra', amount: 'NaN' }] });
+    await assert.rejects(readSupply(mantra.supply), /bad decimal amount/);
+
+    for (const failMatch of [
+      '/cosmos/bank/v1beta1/supply/by_denom?denom=amantra',
+      '/cosmos/mint/v1beta1/params',
+      '/cosmos/distribution/v1beta1/community_pool',
+      `/cosmos/bank/v1beta1/balances/${MANTRA_BURN}`,
+      `/cosmos/staking/v1beta1/delegations/${MANTRA_CONTRIB}`,
+      `/cosmos/staking/v1beta1/delegators/${MANTRA_SEED}/unbonding_delegations`,
+    ]) {
+      fakeMantra({ failMatch });
+      await assert.rejects(readSupply(mantra.supply));
+    }
+  } finally { globalThis.fetch = prev; }
+});
