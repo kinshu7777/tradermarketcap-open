@@ -1701,3 +1701,126 @@ test('aster: missing burn, supply above max, or a broken RPC fail closed', async
     await assert.rejects(readSupply({ method: 'aster' }), /403/);
   } finally { globalThis.fetch = prev; }
 });
+
+// ---------- LayerZero (ZRO, 7 EVM chains + Zero L1 pre-genesis staking) ----------
+// Captured 2026-11-26 from Ethereum/Arbitrum/Optimism/Base/Polygon/BSC/Avax RPCs and staking.layerzero.network/api/staked-total.
+const ZRO_TOKEN = '0x6985884c4392d348587b19cb9eaaf157f13271cd';
+const ZRO_DEAD = '000000000000000000000000000000000000dead';
+const ZRO_FX = {
+  chains: {
+    eth: {
+      totalSupply: '0x000000000000000000000000000000000000000002b979293f07721c867b7000',
+      decimals: '0x0000000000000000000000000000000000000000000000000000000000000012',
+      dead: '0x00000000000000000000000000000000000000000000000004584187f5e86f4b',
+    },
+    arbitrum: {
+      totalSupply: '0x00000000000000000000000000000000000000000015cd4b1e454da8c8960000',
+      decimals: '0x0000000000000000000000000000000000000000000000000000000000000012',
+      dead: '0x0000000000000000000000000000000000000000000000000000005017ff6c18',
+    },
+    optimism: {
+      totalSupply: '0x00000000000000000000000000000000000000000003f2ad4fd9244bb8a8d000',
+      decimals: '0x0000000000000000000000000000000000000000000000000000000000000012',
+      dead: '0x0000000000000000000000000000000000000000000000000000000000000000',
+    },
+    base: {
+      totalSupply: '0x00000000000000000000000000000000000000000004ca20dd75d0d24a1d3000',
+      decimals: '0x0000000000000000000000000000000000000000000000000000000000000012',
+      dead: '0x00000000000000000000000000000000000000000000000001ab6cf38db4da28',
+    },
+    polygon: {
+      totalSupply: '0x000000000000000000000000000000000000000000020ddf9e798caba659c000',
+      decimals: '0x0000000000000000000000000000000000000000000000000000000000000012',
+      dead: '0x0000000000000000000000000000000000000000000000000006c8eaa45db954',
+    },
+    bsc: {
+      totalSupply: '0x00000000000000000000000000000000000000000006723922971d1279348000',
+      decimals: '0x0000000000000000000000000000000000000000000000000000000000000012',
+      dead: '0x0000000000000000000000000000000000000000000000000008e2bf5e98cb03',
+    },
+    avax: {
+      totalSupply: '0x00000000000000000000000000000000000000000000e36445260b144eccd000',
+      decimals: '0x0000000000000000000000000000000000000000000000000000000000000012',
+      dead: '0x0000000000000000000000000000000000000000000000000000000000000000',
+    },
+  },
+  holders: {
+    '744dbc48d11415ec5cb2f78609dea5e1e738da24': '0x0000000000000000000000000000000000000000003987bc25bb4c77d1296000',
+    '1f903473376fbe98cc763f1bc459c8fdb6ac3909': '0x00000000000000000000000000000000000000000017fcfca986ca9a5a7c0000',
+    '8f6449530606a9efddac42e05612427ddeba449c': '0x00000000000000000000000000000000000000000005041dd37781375a3ee200',
+  },
+  stakedTotal: { amount: '108295873950000000000000000', updatedAt: '2026-11-26T15:56:30.912Z' },
+};
+
+function fakeZro({ chains = {}, stakedTotal = ZRO_FX.stakedTotal, httpStatus, rpcError } = {}) {
+  const urlToChain = u => u.includes('eth.') ? 'eth' : u.includes('arb') ? 'arbitrum' : u.includes('opt') ? 'optimism'
+    : u.includes('base') ? 'base' : u.includes('poly') ? 'polygon' : u.includes('bsc') ? 'bsc' : u.includes('avax') ? 'avax' : null;
+  globalThis.fetch = async (url, opts = {}) => {
+    const u = String(url);
+    if (httpStatus) return { ok: false, status: httpStatus, json: async () => ({}) };
+    if (u === 'https://staking.layerzero.network/api/staked-total') {
+      return { ok: true, status: 200, json: async () => stakedTotal };
+    }
+    const chain = urlToChain(u);
+    assert.ok(chain, 'unexpected url in ZRO test: ' + u);
+    const req = JSON.parse(opts.body);
+    if (rpcError && chain === rpcError) {
+      return { ok: true, status: 200, json: async () => ({ jsonrpc: '2.0', id: req.id, error: { message: 'rpc down' } }) };
+    }
+    assert.equal(req.method, 'eth_call');
+    assert.equal(req.params[0].to.toLowerCase(), ZRO_TOKEN);
+    const data = String(req.params[0].data).toLowerCase();
+    const cfg = { ...ZRO_FX.chains[chain], ...(chains[chain] || {}) };
+    let result;
+    if (data === '0x18160ddd') result = cfg.totalSupply;
+    else if (data === '0x313ce567') result = cfg.decimals;
+    else if (data.startsWith('0x70a08231')) {
+      const h = data.slice(-40);
+      result = h === ZRO_DEAD ? cfg.dead : ZRO_FX.holders[h];
+      assert.ok(result, 'unexpected holder ' + h);
+    } else throw new Error('unexpected call ' + data);
+    return { ok: true, status: 200, json: async () => ({ jsonrpc: '2.0', id: req.id, result }) };
+  };
+}
+
+test('layerzero: seed rule sums all 7 EVM chains plus Zero pre-genesis staking and records Foundation/staking exclusions with circulating withheld', async () => {
+  const prev = globalThis.fetch;
+  try {
+    const { layerzero } = JSON.parse(readFileSync(new URL('../data-seed/coins.json', import.meta.url), 'utf8'));
+    assert.equal(layerzero.symbol, 'ZRO');
+    assert.equal(layerzero.supply.method, 'layerzero');
+    assert.equal(layerzero.supply.max, 1000000000);
+    assert.match(layerzero.supply.note, /38\.3% LayerZero Community/);
+    assert.match(layerzero.supply.note, /zerointerop-mainnet/);
+    assert.match(layerzero.supply.note, /0x8F64\.\.\.449C/);
+    fakeZro();
+    const s = await readSupply(layerzero.supply);
+    assert.equal(s.circulating, null, 'circulating is withheld until unlabelled Team/Partner vestings end');
+    assert.equal(s.max, 1000000000);
+    assert.equal(s.parts.length, 8, '7 EVM OFT chains + zerointerop pre-genesis staking');
+    assert.ok(Math.abs(s.total - 999760189.45) < 1, '7 EVM (~891.46M) + Zero stake (108.30M) accounts for >99.97% of 1B cap');
+    assert.equal(s.excluded.length, 5, '0xdEaD burn + Zero stake + 3 proven LayerZero treasury/protocol wallets');
+    assert.ok(Math.abs(s.excluded[1].amount - 108295873.95) < 1e-4);
+    assert.ok(Math.abs(s.excluded[2].amount - 69549761.9) < 1e-4, '0x744D...da24 Foundation twin Safe');
+    assert.equal(Math.round(s.excluded[3].amount), 28999991, 'LayerZero 1');
+    assert.ok(Math.abs(s.excluded[4].amount - 6064068.757) < 1e-3, 'Future Initiatives Multisig');
+    assert.equal(s.checked, true);
+  } finally { globalThis.fetch = prev; }
+});
+
+test('layerzero: bad Zero staking payload, RPC failure, or supply outside 900M..1B fail closed', async () => {
+  const prev = globalThis.fetch;
+  try {
+    fakeZro({ stakedTotal: { amount: 'NaN' } });
+    await assert.rejects(readSupply({ method: 'layerzero' }), /bad Zero staked-total/);
+
+    fakeZro({ stakedTotal: { amount: (300_000_000n * 10n ** 18n).toString() } });
+    await assert.rejects(readSupply({ method: 'layerzero' }), /outside expected/);
+
+    fakeZro({ rpcError: 'arbitrum' });
+    await assert.rejects(readSupply({ method: 'layerzero' }), /rpc down/);
+
+    fakeZro({ httpStatus: 503 });
+    await assert.rejects(readSupply({ method: 'layerzero' }), /503/);
+  } finally { globalThis.fetch = prev; }
+});

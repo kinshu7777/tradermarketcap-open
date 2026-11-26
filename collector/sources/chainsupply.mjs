@@ -1160,7 +1160,110 @@ const METHODS = {
       note: `Total read from Plasma mainnet (verified 10,000,000,000 XPL genesis stateRoot in ${PLASMA_GENESIS_SRC}, less ${fmt2(burned)} XPL burned at the zero and dead addresses; consensus withdrawals are empty and validator inflation is inactive until external stake delegation launches per ${PLASMA_DOCS_SRC}). The ${fmt(bscOftTotal)} bridged XPL on BNB Smart Chain (${EXPLORER.bsc}/token/${PLASMA_OFT}) are LayerZero OFT tokens backed by ${fmt(bridgeLocked)} XPL locked in Plasma's OFT adapter (${addrUrl(PLASMA_OFT)}), so they sit inside the mainnet total. The genesis and protocol Safes still hold ${fmt(safeHeld)} XPL on-chain. Circulating is withheld: Team (25%), Investors (25%) and Ecosystem & Growth (32% post-launch) unlock on schedule through 25 Sep 2028 (${PLASMA_DOCS_SRC}), XPL carries no protocol-level transfer lock (MiCA whitepaper G.11), and the Team and Investor genesis Safes moved their allocations to unpublished custody wallets, so subtracting only the genesis Safes would overstate circulating.`,
     };
   },
+  // LayerZero (ZRO): Omnichain Fungible Token (OFT) at 0x6985...71cd across 7 EVM chains (eth, arbitrum,
+  // optimism, base, polygon, bsc, avax) plus zerointerop-mainnet (EID 33002, peer 0x1ced...5b31). A live
+  // scan of all 187 LayerZero mainnet EIDs confirms those 8 chains are the entire registered peer mesh.
+  // Pre-genesis staking for Zero (opened 23 Nov 2026 at staking.layerzero.network; locked until 31 Mar 2027
+  // per layerzero.network/blog/stake-zro-on-zero) calls OFT.send() targeting EID 33002, burning ZRO on the
+  // source EVM chain and locking it on Zero. Adding staking.layerzero.network/api/staked-total to the 7 EVM
+  // chain supplies accounts for >99.97% of the 1B LayerZeroToken constructor mint (with the tiny remainder in
+  // INFLIGHT OFT transfers + <1 ZRO at 0xdEaD), while listing the Zero stake and the three proven LayerZero
+  // Foundation/protocol wallets in excluded. Circulating stays withheld unless circulating:true is requested.
+  async layerzero(r = {}) {
+    const [chainReads, stakedRes, ...heldBals] = await Promise.all([
+      Promise.all(ZRO_EVM_CHAINS.map(async chain => {
+        const p = { chain, address: ZRO_TOKEN };
+        const [supply, burned] = await Promise.all([
+          erc20TotalSupply(chain, ZRO_TOKEN),
+          erc20Balance(chain, ZRO_TOKEN, BURN),
+        ]);
+        return { chain, supply, burned, src: tokenLink(p) };
+      })),
+      getJSON(ZRO_STAKING_API),
+      ...ZRO_PROTOCOL_WALLETS.map(([holder]) => erc20Balance('eth', ZRO_TOKEN, holder)),
+    ]);
+
+    const rawStaked = stakedRes?.amount;
+    if (typeof rawStaked !== 'string' || !/^\d+$/.test(rawStaked)) {
+      throw new Error('layerzero: bad Zero staked-total payload');
+    }
+    const zeroStaked = Number(BigInt(rawStaked) / 10n ** 12n) / 1e6;
+    if (!Number.isFinite(zeroStaked) || !(zeroStaked > 0)) {
+      throw new Error('layerzero: invalid Zero staked amount ' + zeroStaked);
+    }
+
+    const parts = [];
+    let evmTotal = 0;
+    let deadBurned = 0;
+    for (const c of chainReads) {
+      if (!Number.isFinite(c.supply) || !(c.supply > 0) || !Number.isFinite(c.burned) || c.burned < 0 || c.burned > c.supply) {
+        throw new Error(`layerzero: bad ${c.chain} supply read (${c.supply}, ${c.burned})`);
+      }
+      const net = c.supply - c.burned;
+      evmTotal += net;
+      deadBurned += c.burned;
+      parts.push({ chain: c.chain, amount: net, src: c.src });
+    }
+    parts.push({ chain: 'zerointerop', amount: zeroStaked, src: ZRO_STAKING_SITE });
+
+    const total = evmTotal + zeroStaked;
+    if (!Number.isFinite(total) || !(total > 900_000_000 && total <= ZRO_MAX_SUPPLY)) {
+      throw new Error('layerzero: total outside expected 900M..1B range: ' + total);
+    }
+
+    const excluded = [
+      ...(deadBurned > 0 ? [{
+        reason: 'Burn address (0x...dEaD across EVM chains; subtracted from total)',
+        holder: BURN,
+        amount: deadBurned,
+        src: holderLink({ chain: 'eth', address: ZRO_TOKEN }, BURN),
+      }] : []),
+      {
+        reason: 'Zero L1 pre-genesis ZRO staking (EID 33002, locked until 31 Mar 2027 per layerzero.network/blog/stake-zro-on-zero)',
+        holder: ZRO_ZERO_PEER,
+        amount: zeroStaked,
+        src: ZRO_STAKING_BLOG,
+      },
+      ...ZRO_PROTOCOL_WALLETS.map(([holder, reason], i) => ({
+        reason,
+        holder,
+        amount: heldBals[i],
+        src: holderLink({ chain: 'eth', address: ZRO_TOKEN }, holder),
+      })).filter(e => {
+        if (!Number.isFinite(e.amount) || e.amount < 0) throw new Error('layerzero: bad holder balance for ' + e.holder);
+        return e.amount > 0;
+      }),
+    ];
+
+    const nonBurnOut = excluded.filter(e => e.holder !== BURN).reduce((s, e) => s + e.amount, 0);
+    const ceiling = total - nonBurnOut;
+    if (!Number.isFinite(ceiling) || !(ceiling > 0 && ceiling <= total)) {
+      throw new Error('layerzero: bad circulating ceiling ' + ceiling);
+    }
+
+    return {
+      circulating: r.circulating === true ? ceiling : null,
+      total,
+      src: `${EXPLORER.eth}/token/${ZRO_TOKEN}`,
+      parts,
+      excluded,
+      note: r.note,
+    };
+  },
 };
+
+const ZRO_TOKEN = '0x6985884C4392D348587B19cb9eAAf157F13271cd';
+const ZRO_MAX_SUPPLY = 1_000_000_000;
+const ZRO_EVM_CHAINS = ['eth', 'arbitrum', 'optimism', 'base', 'polygon', 'bsc', 'avax'];
+const ZRO_STAKING_SITE = 'https://staking.layerzero.network/';
+const ZRO_STAKING_API = 'https://staking.layerzero.network/api/staked-total';
+const ZRO_STAKING_BLOG = 'https://layerzero.network/blog/stake-zro-on-zero';
+const ZRO_ZERO_PEER = '0x1ced7d571059a30db0fc9adc40346d2a1ce55b31';
+const ZRO_PROTOCOL_WALLETS = [
+  ['0x744Dbc48D11415ec5cB2f78609DeA5E1E738DA24', 'LayerZero Foundation twin 3/5 Safe (shares identical 5 signers with LayerZero: Future Initiatives Multisig; received 145M from 1B genesis mint)'],
+  ['0x1f903473376fBe98cc763F1Bc459C8fdB6AC3909', 'LayerZero 1 (Etherscan public label; funded 30M ZRO by LayerZero: Future Initiatives Multisig)'],
+  ['0x8F6449530606A9EFddaC42e05612427dDeBA449C', 'LayerZero: Future Initiatives Multisig (Etherscan public label)'],
+];
 
 const SEI_GRINGOTTS_INFO = Buffer.from('{"info":{}}').toString('base64');
 const seiFromUsei = u => Number(u / 1_000_000n) + Number(u % 1_000_000n) / 1e6;
