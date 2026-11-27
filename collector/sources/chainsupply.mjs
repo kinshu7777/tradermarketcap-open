@@ -1414,7 +1414,134 @@ const METHODS = {
       note: `Total read across all 7 public EVM OFT deployments (${fmt(rawTotal)} ZRO, less ${fmt2(burned)} ZRO at burn addresses). LayerZeroToken (${EXPLORER.eth}/address/${ZRO}#code) minted the fixed 1,000,000,000 ZRO cap once in its Ethereum constructor with no mint() or burn() function, and protocol fee-switch referendums #1-#4 all voted Off (${ZRO_FEE_SWITCH_SRC}). Scanning peers(eid) across EIDs 1..40499 confirms that the remaining ${fmt(bridgedOut)} ZRO left the 7 EVM OFTs via OFT._debit to the 8th active OFT peer EID 33002 (zerointerop, LayerZero's native-ZRO Zero L1 bound on 2026-11-21 to peer 0x1ced7d571059a30db0fc9adc40346d2a1ce55b31 and listed in https://metadata.layerzero-api.com/v1/metadata with no public RPC yet, plus minor in-flight OFT messages). Excluded balances read live: ${fmt(nonBurnHeld)} ZRO across tokens parked at the OFT contracts themselves, the labeled LayerZero 1 wallet (0x1f90...3909), and the Foundation Stargate-revenue buyback multisig (${ZRO_BUYBACKS_SRC}). Circulating is withheld: per LayerZero's tokenomics (${ZRO_TOKENOMICS_SRC}), Strategic Partners (32.2%, 322M ZRO) and Core Contributors (25.5%, 255M ZRO) vest over 3 years (1-year lock then 24 monthly unlocks through 20 Jun 2027) alongside Foundation Ecosystem & Growth (14.5%, 145M ZRO), while other large Ethereum holders (GnosisSafeProxy 0x744D...DA24 and 0x806f...8431, BitGo WalletSimple contracts 0x6e0e...2427 / 0x637c...F7BF / 0xC2f3...D412, and EOA 0x7be1...7CFD) carry no public treasury or vesting label, so subtracting only the labeled wallets would overstate circulating.`,
     };
   },
+  // Monad (MON, chain id 143). Native gas token on Monad mainnet.
+  // Total supply is the Foundation's published 100B genesis (https://monad.xyz/blog/mon-tokenomics-overview)
+  // plus piecewise consensus block rewards minted via syscallReward (0x791bdcf3) to 0x1000:
+  //   - blocks 37,304,999..89,656,734 inclusive: 25 MON/block (52,351,736 blocks = 1,308,793,400 MON)
+  //   - blocks >= 89,656,735 inclusive (MIP-12): 18 MON/block
+  // minus verified on-chain balances at the zero and dead burn addresses. Cumulative EIP-1559 base-fee burns
+  // are not exposed by Monad JSON-RPC or a primary Foundation endpoint and are not subtracted. Every pass also
+  // verifies the live tip block's syscallReward value so any future MIP emission change fails closed.
+  async monad(r = {}) {
+    const genesis = Number(r.genesis ?? MONAD_GENESIS_SUPPLY);
+    const schedule = Array.isArray(r.schedule) ? r.schedule : MONAD_REWARD_SCHEDULE;
+    if (!(genesis > 0) || schedule.length === 0) {
+      throw new Error('monad: invalid configuration');
+    }
+    for (let i = 0; i < schedule.length; i++) {
+      const s = schedule[i];
+      if (!Number.isInteger(s?.startBlock) || s.startBlock <= 0 || !(Number(s?.reward) > 0)) {
+        throw new Error('monad: invalid configuration');
+      }
+      if (i > 0 && s.startBlock <= schedule[i - 1].startBlock) {
+        throw new Error('monad: invalid configuration');
+      }
+    }
+
+    const rpcUrl = r.rpc || MONAD_RPC;
+    const rpcCall = async (method, params = []) => {
+      const res = await getJSON(rpcUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      });
+      if (res?.error) throw new Error('monad rpc error: ' + (res.error.message || JSON.stringify(res.error)));
+      return res?.result;
+    };
+
+    const wei = hex => {
+      if (typeof hex !== 'string' || !/^0x[0-9a-f]+$/i.test(hex)) throw new Error('monad: bad balance hex ' + hex);
+      return Number(BigInt(hex) / 10n ** 12n) / 1e6;
+    };
+
+    const [chainIdHex, latestBlock, epochRaw, zeroHex, deadHex, stakingHex] = await Promise.all([
+      rpcCall('eth_chainId', []),
+      rpcCall('eth_getBlockByNumber', ['latest', true]),
+      rpcCall('eth_call', [{ to: MONAD_STAKING_PRECOMPILE, data: '0x757991a8' }, 'latest']),
+      rpcCall('eth_getBalance', [ZERO, 'latest']),
+      rpcCall('eth_getBalance', [BURN, 'latest']),
+      rpcCall('eth_getBalance', [MONAD_STAKING_PRECOMPILE, 'latest']),
+    ]);
+
+    if (typeof chainIdHex !== 'string' || !/^0x[0-9a-f]+$/i.test(chainIdHex)) throw new Error('monad: bad chain id');
+    const chainId = Number(BigInt(chainIdHex));
+    if (chainId !== 143) throw new Error('monad: not mainnet chain id 143 (' + chainId + ')');
+
+    const blockHex = latestBlock?.number;
+    if (typeof blockHex !== 'string' || !/^0x[0-9a-f]+$/i.test(blockHex)) throw new Error('monad: bad block number');
+    const block = Number(BigInt(blockHex));
+    const firstRewardBlock = schedule[0].startBlock;
+    if (!(block >= firstRewardBlock) || !Number.isSafeInteger(block)) {
+      throw new Error(`monad: block ${block} is below reward start block ${firstRewardBlock}`);
+    }
+
+    // Verify live tip block's consensus syscallReward(address) (0x791bdcf3) matches the active schedule stage.
+    let activeStage = schedule[0];
+    for (const s of schedule) {
+      if (block >= s.startBlock) activeStage = s;
+    }
+    const txs = Array.isArray(latestBlock?.transactions) ? latestBlock.transactions : null;
+    const rewardTx = txs?.find(
+      t => typeof t?.to === 'string' && t.to.toLowerCase() === MONAD_STAKING_PRECOMPILE
+        && typeof t?.input === 'string' && t.input.toLowerCase().startsWith(MONAD_SYSCALL_REWARD_SEL),
+    );
+    if (!rewardTx || typeof rewardTx.value !== 'string' || !/^0x[0-9a-f]+$/i.test(rewardTx.value)) {
+      throw new Error('monad: missing syscallReward transaction in latest block');
+    }
+    const expectedRewardWei = BigInt(Math.round(activeStage.reward * 1e6)) * 10n ** 12n;
+    if (BigInt(rewardTx.value) !== expectedRewardWei) {
+      throw new Error(`monad: latest syscallReward value ${rewardTx.value} does not match ${activeStage.reward} MON`);
+    }
+
+    if (typeof epochRaw !== 'string' || !/^0x[0-9a-f]+$/i.test(epochRaw) || epochRaw.length < 66) {
+      throw new Error('monad: bad getEpoch response');
+    }
+    const epoch = Number(BigInt('0x' + epochRaw.slice(2, 66)));
+    if (!(epoch > 0)) throw new Error('monad: getEpoch returned 0');
+
+    const zero = wei(zeroHex);
+    const dead = wei(deadHex);
+    const staked = wei(stakingHex);
+
+    let emitted = 0;
+    for (let i = 0; i < schedule.length; i++) {
+      const s = schedule[i];
+      if (block < s.startBlock) break;
+      const endBlock = i + 1 < schedule.length ? Math.min(block, schedule[i + 1].startBlock - 1) : block;
+      emitted += (endBlock - s.startBlock + 1) * s.reward;
+    }
+
+    const burned = zero + dead;
+    const total = genesis + emitted - burned;
+
+    if (!(total > genesis) || !Number.isFinite(total)) throw new Error('monad: bad total ' + total);
+    if (!(staked < total)) throw new Error(`monad: staking contract holds ${staked} which is not below total ${total}`);
+
+    const scan = 'https://monadscan.com/address/';
+    const excluded = [
+      { reason: 'Zero address (unspendable)', holder: ZERO, amount: zero, src: scan + ZERO },
+      { reason: 'Burn address', holder: BURN, amount: dead, src: scan + BURN },
+    ].filter(e => e.amount > 0);
+
+    const publish = r.circulating !== false;
+    return {
+      circulating: publish ? total - excluded.reduce((s, e) => s + e.amount, 0) : null,
+      total,
+      src: 'https://docs.monad.xyz/monad-arch/consensus/staking',
+      excluded,
+      note: r.note || `Total is the Monad Foundation's 100 billion MON genesis (https://monad.xyz/blog/mon-tokenomics-overview) plus piecewise consensus block rewards minted on-chain via syscallReward (25 MON/block across blocks 37,304,999..89,656,734, then 18 MON/block from MIP-12 block 89,656,735 onward; https://docs.monad.xyz/monad-arch/consensus/staking) less ${burned.toLocaleString('en-US', { maximumFractionDigits: 0 })} MON burned at the zero and dead addresses. Protocol EIP-1559 base-fee burns are not exposed cumulatively by Monad JSON-RPC or a primary Foundation endpoint and are not subtracted. Staked MON (${staked.toLocaleString('en-US', { maximumFractionDigits: 0 })} MON at 0x1000) belongs to delegators and remains circulating. Circulating supply is withheld per Foundation tokenomics disclosure: team, investor, Category Labs treasury and ecosystem allocations are locked off-chain without on-chain labeled contracts.`,
+    };
+  },
 };
+
+const MONAD_RPC = 'https://rpc.monad.xyz';
+const MONAD_GENESIS_SUPPLY = 100_000_000_000;
+const MONAD_REWARD_SCHEDULE = [
+  { startBlock: 37_304_999, reward: 25 },
+  { startBlock: 89_656_735, reward: 18 },
+];
+const MONAD_STAKING_PRECOMPILE = '0x0000000000000000000000000000000000001000';
+const MONAD_SYSCALL_REWARD_SEL = '0x791bdcf3';
 
 const AMANTRA = 10n ** 18n;
 const MANTRA_BURN = 'mantra1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqcg2my8';
