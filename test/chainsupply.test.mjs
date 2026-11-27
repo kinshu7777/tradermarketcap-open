@@ -2237,6 +2237,10 @@ test('monad: seed rule publishes 100B genesis plus piecewise 25->18 MON/block sc
     assert.match(s.note, /Circulating supply is withheld/);
     assert.equal(s.checked, true);
     assert.equal(s.method, 'monad');
+
+    fakeMonad();
+    const sDefault = await readSupply({ method: 'monad' });
+    assert.equal(sDefault.circulating, null, 'circulating defaults to withheld even without seed circulating:false');
   } finally {
     globalThis.fetch = prev;
   }

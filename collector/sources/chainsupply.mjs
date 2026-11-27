@@ -1523,9 +1523,9 @@ const METHODS = {
       { reason: 'Burn address', holder: BURN, amount: dead, src: scan + BURN },
     ].filter(e => e.amount > 0);
 
-    const publish = r.circulating !== false;
+    const publish = r.circulating === true;
     return {
-      circulating: publish ? total - excluded.reduce((s, e) => s + e.amount, 0) : null,
+      circulating: publish ? total : null,
       total,
       src: 'https://docs.monad.xyz/monad-arch/consensus/staking',
       excluded,
