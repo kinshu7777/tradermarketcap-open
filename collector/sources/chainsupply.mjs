@@ -1352,7 +1352,91 @@ const METHODS = {
       note: `Total read across all 7 public EVM OFT deployments (${fmt(rawTotal)} ZRO, less ${fmt2(burned)} ZRO at burn addresses). LayerZeroToken (${EXPLORER.eth}/address/${ZRO}#code) minted the fixed 1,000,000,000 ZRO cap once in its Ethereum constructor with no mint() or burn() function, and protocol fee-switch referendums #1-#4 all voted Off (${ZRO_FEE_SWITCH_SRC}). Scanning peers(eid) across EIDs 1..40499 confirms that the remaining ${fmt(bridgedOut)} ZRO left the 7 EVM OFTs via OFT._debit to the 8th active OFT peer EID 33002 (zerointerop, LayerZero's native-ZRO Zero L1 bound on 2026-11-21 to peer 0x1ced7d571059a30db0fc9adc40346d2a1ce55b31 and listed in https://metadata.layerzero-api.com/v1/metadata with no public RPC yet, plus minor in-flight OFT messages). Excluded balances read live: ${fmt(nonBurnHeld)} ZRO across tokens parked at the OFT contracts themselves, the labeled LayerZero 1 wallet (0x1f90...3909), and the Foundation Stargate-revenue buyback multisig (${ZRO_BUYBACKS_SRC}). Circulating is withheld: per LayerZero's tokenomics (${ZRO_TOKENOMICS_SRC}), Strategic Partners (32.2%, 322M ZRO) and Core Contributors (25.5%, 255M ZRO) vest over 3 years (1-year lock then 24 monthly unlocks through 20 Jun 2027) alongside Foundation Ecosystem & Growth (14.5%, 145M ZRO), while other large Ethereum holders (GnosisSafeProxy 0x744D...DA24 and 0x806f...8431, BitGo WalletSimple contracts 0x6e0e...2427 / 0x637c...F7BF / 0xC2f3...D412, and EOA 0x7be1...7CFD) carry no public treasury or vesting label, so subtracting only the labeled wallets would overstate circulating.`,
     };
   },
+  // Official Trump (TRUMP, Solana SPL mint 6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN).
+  // Per gettrumpmemes.com/#tokenomics, 80% of the 1B initial cap (800M TRUMP across Creators & CIC Digital
+  // Groups 1-6) unlocks over 36 months while 20% (200M: 10% public, 10% liquidity) launched unlocked.
+  // On-chain inspection of the top 20 token accounts shows #1 (HkykUVWTctptXZmRTWearMsH4SaQNmE4Ku3tMJe5v2mH)
+  // is owned by PDA 2RH6rUTPBJ9rUDPpuV9b8z1YL56k1tYU6Uk5ZoaEFFSK under the Magna Token Vesting Program
+  // (magnaSHyv8zzKJJmr8NSz5JXmtdGDTTFPEADmvNAwbj). All other top-20 holders—including the Magna withdrawal
+  // wallet (2JEPvvG1kACwDJgacgEABnY3uiL7RLRncPW3APjNPNme) and genesis distributor wallet
+  // (5e2qRc1DNEXmyxP8qwPwJhRWjef7usLyi7v5xjqLr5G7)—are ordinary System Program wallets with no lock program
+  // or Meteora DLMM liquidity pools, so tokens withdrawn from vesting count as circulating. Every pass
+  // verifies the Magna program owner and SPL token account mint/owner bytes before subtracting the vault.
+  async trump(r = {}) {
+    const [sup, multi] = await Promise.all([
+      sol('getTokenSupply', [TRUMP_MINT]),
+      sol('getMultipleAccounts', [
+        [TRUMP_MAGNA_PDA, TRUMP_MAGNA_TA],
+        { encoding: 'base64' },
+      ]),
+    ]);
+    const rawTotal = sup?.value?.amount;
+    if (sup?.value?.decimals !== 6 || typeof rawTotal !== 'string' || !/^\d+$/.test(rawTotal)) {
+      throw new Error('trump: bad mint supply');
+    }
+    const totalMicro = BigInt(rawTotal);
+    const total = trumpFromMicro(totalMicro);
+    if (!(total > 900_000_000 && total <= 1_000_000_000)) {
+      throw new Error('trump: unexpected total supply ' + total);
+    }
+
+    const vals = multi?.value;
+    if (!Array.isArray(vals) || vals.length !== 2) throw new Error('trump: bad getMultipleAccounts response');
+    if (vals[0]?.owner !== TRUMP_MAGNA_PROGRAM) {
+      throw new Error('trump: Magna vesting PDA owner changed: ' + vals[0]?.owner);
+    }
+
+    const info = vals[1];
+    if (!info || info.owner !== SPL_TOKEN_PROGRAM || !Array.isArray(info.data) || typeof info.data[0] !== 'string') {
+      throw new Error('trump: missing or invalid SPL token account for Magna vesting vault');
+    }
+    const buf = Buffer.from(info.data[0], 'base64');
+    if (buf.length < 72) throw new Error('trump: short SPL token account for Magna vesting vault');
+    if (!buf.subarray(0, 32).equals(trumpB58Bytes(TRUMP_MINT))) {
+      throw new Error('trump: mint mismatch on Magna vesting vault');
+    }
+    if (!buf.subarray(32, 64).equals(trumpB58Bytes(TRUMP_MAGNA_PDA))) {
+      throw new Error('trump: token account owner changed on Magna vesting vault');
+    }
+    const magnaMicro = buf.readBigUInt64LE(64);
+    if (magnaMicro <= 0n) throw new Error('trump: Magna vesting vault reads zero; review lock state');
+    if (magnaMicro >= totalMicro) throw new Error('trump: excluded exceeds total supply');
+
+    const circulating = trumpFromMicro(totalMicro - magnaMicro);
+    const excluded = [
+      {
+        reason: 'Creators & CIC Digital vesting vault (PDA owned by Magna program magnaSHyv8zzKJJmr8NSz5JXmtdGDTTFPEADmvNAwbj; token account HkykUVWTctptXZmRTWearMsH4SaQNmE4Ku3tMJe5v2mH)',
+        holder: TRUMP_MAGNA_PDA,
+        amount: trumpFromMicro(magnaMicro),
+        src: `https://solscan.io/account/${TRUMP_MAGNA_PDA}`,
+      },
+    ];
+    return {
+      circulating: r.circulating === false ? null : circulating,
+      total,
+      src: `https://solscan.io/token/${TRUMP_MINT}`,
+      parts: [{ chain: 'sol', amount: total, src: `https://solscan.io/token/${TRUMP_MINT}` }],
+      excluded,
+      note: r.note,
+    };
+  },
 };
+
+const SPL_TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
+const TRUMP_MINT = '6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN';
+const TRUMP_MAGNA_PROGRAM = 'magnaSHyv8zzKJJmr8NSz5JXmtdGDTTFPEADmvNAwbj';
+const TRUMP_MAGNA_PDA = '2RH6rUTPBJ9rUDPpuV9b8z1YL56k1tYU6Uk5ZoaEFFSK';
+const TRUMP_MAGNA_TA = 'HkykUVWTctptXZmRTWearMsH4SaQNmE4Ku3tMJe5v2mH';
+const trumpFromMicro = u => Number(u / 1_000_000n) + Number(u % 1_000_000n) / 1e6;
+const TRUMP_B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+function trumpB58Bytes(s) {
+  let n = 0n;
+  for (const c of s) n = n * 58n + BigInt(TRUMP_B58.indexOf(c));
+  let zeros = 0;
+  while (zeros < s.length && s[zeros] === '1') zeros++;
+  const hex = n === 0n ? '' : n.toString(16).padStart((32 - zeros) * 2, '0');
+  return Buffer.concat([Buffer.alloc(zeros), Buffer.from(hex, 'hex')]);
+}
 
 const AMANTRA = 10n ** 18n;
 const MANTRA_BURN = 'mantra1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqcg2my8';

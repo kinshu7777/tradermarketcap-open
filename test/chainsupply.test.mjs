@@ -2052,3 +2052,95 @@ test('ZRO: missing EID 33002 peer, 7-chain sum above 1B cap, NaN, or any chain R
   }
   assert.equal(globalThis.fetch, prev, 'globalThis.fetch is restored after test');
 });
+
+// ---------- Official Trump (TRUMP, Solana) ----------
+// Captured 2026-11-27 (slot 474381841) from https://api.mainnet-beta.solana.com.
+const TRUMP_MINT = '6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN';
+const TRUMP_MAGNA_PROG = 'magnaSHyv8zzKJJmr8NSz5JXmtdGDTTFPEADmvNAwbj';
+const TRUMP_MAGNA_PDA = '2RH6rUTPBJ9rUDPpuV9b8z1YL56k1tYU6Uk5ZoaEFFSK';
+const TRUMP_FX = {
+  supply: { amount: '999998750358814', decimals: 6, uiAmount: 999998750.358814, uiAmountString: '999998750.358814' },
+  accounts: [
+    { owner: TRUMP_MAGNA_PROG, data: ['raPK/yAI2/EgAAAAYWNjZGY5ZGVmMmJmNGU4NjgzZjUxMjNi', 'base64'] },
+    { owner: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', data: ['Vlt4uuxb1v8GYzMY6iDn9jmNLzKA6Pf4w4BOKI54p40VE9Tqodm3yliDn3UsRWaWr6FgrqqLVEVTFVEILys01DL65Sg5ggIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 'base64'] },
+  ],
+};
+
+function fakeTrump({ supply = TRUMP_FX.supply, accounts = TRUMP_FX.accounts, httpStatus, rpcError } = {}) {
+  globalThis.fetch = async (url, opts = {}) => {
+    if (httpStatus) return { ok: false, status: httpStatus, json: async () => ({}) };
+    assert.ok(String(url).includes('solana'), 'only Solana RPC is called: ' + url);
+    const req = JSON.parse(opts.body);
+    if (rpcError) return { ok: true, status: 200, json: async () => ({ jsonrpc: '2.0', id: req.id, error: { message: rpcError } }) };
+    if (req.method === 'getTokenSupply') {
+      assert.equal(req.params[0], TRUMP_MINT);
+      return { ok: true, status: 200, json: async () => ({ jsonrpc: '2.0', id: req.id, result: { value: supply } }) };
+    }
+    if (req.method === 'getMultipleAccounts') {
+      assert.deepEqual(req.params[0], [TRUMP_MAGNA_PDA, 'HkykUVWTctptXZmRTWearMsH4SaQNmE4Ku3tMJe5v2mH']);
+      return { ok: true, status: 200, json: async () => ({ jsonrpc: '2.0', id: req.id, result: { value: accounts } }) };
+    }
+    throw new Error('unexpected solana method ' + req.method);
+  };
+}
+
+test('trump: seed rule verifies Magna vesting PDA on-chain and subtracts only the locked Magna vault', async () => {
+  const prev = globalThis.fetch;
+  try {
+    const rule = JSON.parse(readFileSync(new URL('../data-seed/coins.json', import.meta.url), 'utf8'))['official-trump'];
+    assert.equal(rule.symbol, 'TRUMP');
+    assert.equal(rule.name, 'Official Trump');
+    assert.equal(rule.supply.method, 'trump');
+    assert.equal(rule.supply.max, 1000000000);
+    assert.match(rule.supply.note, /gettrumpmemes\.com\/#tokenomics/);
+    assert.match(rule.supply.note, /magnaSHyv8zzKJJmr8NSz5JXmtdGDTTFPEADmvNAwbj/);
+    assert.match(rule.supply.note, /tokens withdrawn from vesting count as circulating/);
+    fakeTrump();
+    const s = await readSupply(rule.supply);
+    assert.ok(Math.abs(s.total - 999998750.358814) < 1e-6);
+    assert.equal(s.max, 1000000000);
+    assert.equal(s.excluded.length, 1);
+    assert.equal(s.excluded[0].holder, TRUMP_MAGNA_PDA);
+    assert.ok(Math.abs(s.excluded[0].amount - 706131964.328498) < 1e-6, 'Magna vesting vault');
+    assert.ok(Math.abs(s.circulating - (s.total - s.excluded[0].amount)) < 1e-6);
+    assert.ok(Math.abs(s.circulating - 293866786.030316) < 1e-6);
+    assert.equal(s.src, `https://solscan.io/token/${TRUMP_MINT}`);
+    assert.equal(s.checked, true);
+  } finally {
+    globalThis.fetch = prev;
+  }
+  assert.equal(globalThis.fetch, prev, 'globalThis.fetch is restored after test');
+});
+
+test('trump: wrong Magna program owner, mutated SPL account owner, emptied vault, NaN/malformed supply or RPC errors fail closed', async () => {
+  const prev = globalThis.fetch;
+  try {
+    fakeTrump({ supply: { ...TRUMP_FX.supply, amount: 'NaN' } });
+    await assert.rejects(readSupply({ method: 'trump' }), /bad mint supply/);
+
+    const wrongProg = TRUMP_FX.accounts.map((a, i) => (i === 0 ? { ...a, owner: '11111111111111111111111111111111' } : a));
+    fakeTrump({ accounts: wrongProg });
+    await assert.rejects(readSupply({ method: 'trump' }), /Magna vesting PDA owner changed/);
+
+    const badOwnerBuf = Buffer.from(TRUMP_FX.accounts[1].data[0], 'base64');
+    Buffer.alloc(32, 7).copy(badOwnerBuf, 32);
+    const wrongOwner = TRUMP_FX.accounts.map((a, i) => (i === 1 ? { ...a, data: [badOwnerBuf.toString('base64'), 'base64'] } : a));
+    fakeTrump({ accounts: wrongOwner });
+    await assert.rejects(readSupply({ method: 'trump' }), /token account owner changed/);
+
+    const zeroBuf = Buffer.from(TRUMP_FX.accounts[1].data[0], 'base64');
+    zeroBuf.writeBigUInt64LE(0n, 64);
+    const emptiedMagna = TRUMP_FX.accounts.map((a, i) => (i === 1 ? { ...a, data: [zeroBuf.toString('base64'), 'base64'] } : a));
+    fakeTrump({ accounts: emptiedMagna });
+    await assert.rejects(readSupply({ method: 'trump' }), /Magna vesting vault reads zero/);
+
+    fakeTrump({ rpcError: 'rpc down' });
+    await assert.rejects(readSupply({ method: 'trump' }), /rpc down/);
+
+    fakeTrump({ httpStatus: 503 });
+    await assert.rejects(readSupply({ method: 'trump' }), /503/);
+  } finally {
+    globalThis.fetch = prev;
+  }
+  assert.equal(globalThis.fetch, prev, 'globalThis.fetch is restored after test');
+});

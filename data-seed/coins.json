@@ -271,5 +271,18 @@
       "note": "Total native amantra (18 decimals; 1:4 split from OM at block 13,000,000 on 2 Mar 2026 after legacy Ethereum ERC-20 OM was deprecated on 15 Jan 2026, docs.mantrachain.io/mantra-token-background) read from MANTRA Chain x/bank (/cosmos/bank/v1beta1/supply/by_denom?denom=amantra), cross-checked against x/mint max_supply (10,000,000,000 MANTRA, docs.mantrachain.io/mantra-tokenomics), minus any balance at MANTRA's native burn address mantra1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqcg2my8. Provable non-circulating balances (liquid + staked + unbonding; read via a dedicated method rather than generic cosmos, which reads liquid x/bank balances only) are reported in excluded: the community pool and the six genesis/first-hop reserve accounts traced from github.com/MANTRA-Chain/net (mantra-1/genesis.json). Circulating supply is withheld because mantra-1/genesis.json created all 19 accounts as plain BaseAccounts (no x/vesting accounts): after mantra1yejp... burned 150M OM (600M MANTRA) to mantra1qqqq...cg2my8 at block 4981529, remaining Core Contributor tokens still inside their 30-month cliff through 10 Apr 2027, dispersed Pre-Seed/Seed vesting tranches, and the MANTRA Chain Association treasury (12.8% of genesis plus 40% of block inflation per docs.mantrachain.io/mantra-chain-tokenomics; live x/mint params set inflation_min = inflation_max = 0.16) sit in unlabelled BaseAccounts with no published wallet list or first-party circulating API, so publishing the on-chain ceiling would overstate circulating supply."
     }
   },
-  "layerzero": {"symbol": "ZRO", "name": "LayerZero", "links": {"site": "https://layerzero.foundation", "contract": "https://etherscan.io/token/0x6985884C4392D348587B19cb9eAAf157F13271cd"}, "supply": {"method": "layerzero", "max": 1000000000}}
+  "layerzero": {"symbol": "ZRO", "name": "LayerZero", "links": {"site": "https://layerzero.foundation", "contract": "https://etherscan.io/token/0x6985884C4392D348587B19cb9eAAf157F13271cd"}, "supply": {"method": "layerzero", "max": 1000000000}},
+  "official-trump": {
+    "symbol": "TRUMP",
+    "name": "Official Trump",
+    "links": {
+      "site": "https://gettrumpmemes.com/#tokenomics",
+      "contract": "https://solscan.io/token/6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN"
+    },
+    "supply": {
+      "method": "trump",
+      "max": 1000000000,
+      "note": "Total supply read live from Solana SPL mint 6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN (1,000,000,000 initial cap; 20% public and liquidity at TGE, 80% / 800,000,000 Creators & CIC Digital Groups 1-6 on a 36-month unlock schedule per https://gettrumpmemes.com/#tokenomics). On-chain inspection of the top 20 token accounts shows #1 (HkykUVWTctptXZmRTWearMsH4SaQNmE4Ku3tMJe5v2mH) is owned by PDA 2RH6rUTPBJ9rUDPpuV9b8z1YL56k1tYU6Uk5ZoaEFFSK under the Magna Token Vesting Program (magnaSHyv8zzKJJmr8NSz5JXmtdGDTTFPEADmvNAwbj); all other top-20 token accounts—including the Magna withdrawal wallet (2JEPvvG1kACwDJgacgEABnY3uiL7RLRncPW3APjNPNme) and genesis distributor wallet (5e2qRc1DNEXmyxP8qwPwJhRWjef7usLyi7v5xjqLr5G7)—are ordinary System Program wallets with no lock program or Meteora DLMM liquidity pools, so tokens withdrawn from vesting count as circulating. Circulating supply is live mint supply minus the verified Magna vesting vault."
+    }
+  }
 }
